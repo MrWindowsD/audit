@@ -4,13 +4,133 @@
 
 ---
 
+## [Release #4.7] - Удалён Sniper (split-tunnel от test_domains)
+
+### 🛠 Критическое
+- **Удалён Sniper Mode:** `test_domains` снова **только для Auto-Tuner**, не для live-маршрутизации.
+- **Live:** при активном профиле (`type != 0`) весь TCP идёт через `pipeline` + L7/L4 — как до #3.10.
+- **Тюнер:** добавлен `youtubei.googleapis.com:443` в список тестов.
+
+### ❌ Откат ошибочной логики
+- Whitelist из `test_domains` → `dpi=direct` для API (youtubei, suggestqueries…) — **убрано**.
+
+### 📜 Зафиксировано в docs (README / CODEMAP)
+- **Фрагментация не должна ломать связность** — иначе стратегия бракована.
+- **Полноценный split-tunnel** (домены + приложения) — **Epic 5**, не костыль в Epic 3.
+
+---
+
+## [Release #4.6] - Fragmentation Core Audit Hot-Fix
+
+### 🛠 Исправления
+- **Shredder:** Реализованы три режима — Smart (крошение до mid-SNI), Limit (первые N байт), SNI-zone; раньше #8/#9 игнорировали `SNISmartSplit`, #7 игнорировал `ShredderLimit`.
+- **JSON профиля:** `shred_chunk` / `shred_limit` в Marshal/Unmarshal — сохранённый Shredder-профиль не обнулялся.
+- **Sniper:** домены в `SetSniperTargets` нормализуются в lower case.
+- **fragmentedConn / MixedCase:** фрагментация только при **полном** первом TLS record.
+- **Auto-Tuner:** +3с таймаут на раунды Shredder; `isRST` через `strings.Contains`.
+
+### 📝 Новый файл
+- `shredder.go` — `writeShredded`, `isCompleteTLSFirstRecord`, warn small CH.
+
+---
+
+## [Release #4.5] - Sniper Fix: SNI before Dial (YouTube live)
+
+### 🛠 Критическое исправление
+- **Корень поломки YouTube:** Sniper Mode сравнивал **IP** из TUN (`142.250.x.x:443`) со списком **доменов** → live-трафик шёл `direct` без L7 split, тюнер тестировал по hostname и показывал 46%.
+- **Fix:** `proxyTCP` сначала читает ClientHello, извлекает SNI, затем `pipeline` или `direct` Dial. Решение по домену, не по IP.
+- **BypassMiddleware:** только локальные IP; Sniper перенесён в `sniper.go`.
+
+### 📝 Логи
+- `🎯 [LIVE] peer=... sni=... dpi=pipeline|direct strat_type=...` — диагностика живого трафика.
+
+### 🛠 Тюнер
+- Shredder (#7–#9) временно убирался из матрицы (v4.4); **возвращён** для итераций по логам `[LIVE]` / `HEATMAP`.
+
+---
+
+## [Release #4.5.1] - Shredder back in Auto-Tuner
+
+- Профили **#7–#9** снова в `defaultStrategies` (10 профилей, 0–9).
+- `tuner_profiles_shredder_archive.go` — справочник для экспериментальных вариантов chunk/limit.
+
+---
+
+## [Release #3.11] - Advanced Test Insights & Analytics
+
+### 📊 Аналитика и диагностика
+- **DPI Fingerprinting:** Тюнер теперь анализирует время сброса соединения (RST). Если сброс происходит быстрее 150 мс — это помечается как активное вмешательство DPI. Более долгие сбросы трактуются как проблемы сервера или канала.
+- **Packet Size Analytics:** Внедрена проверка размера ClientHello. При обнаружении аномально малых пакетов (<200 байт) выводится предупреждение о возможной фрагментации на стороне приложения.
+- **Success Heatmap:** В конце каждого раунда тюнинга выводится итоговая статистика по стратегии (например, `Strategy #2: 8/13 domains OK`), что позволяет мгновенно оценить эффективность профиля без чтения логов по каждому домену.
+
+## [Release #3.10] - Sniper Mode & IPv6 Neutralization
+
+### 🚀 Глобальные изменения (Sniper Mode)
+- **Targeted Routing:** Внедрена система «снайперского» обхода. Теперь фрагментация и мутация SNI применяются **только** к доменам из списка тюнера (YouTube, Instagram и др.). Все остальные сайты (банки, VK, гос-сервисы) идут через прямой Bypass. Это полностью решает проблему `ERR_SSL_PROTOCOL` на легитимных ресурсах.
+- **IPv6 Kill:** IPv6 полностью удален из конфигурации TUN-интерфейса. Это устранило ошибки `network is unreachable` и стабилизировало работу DNS-резолвера.
+
+### 🌪️ Хирургическая Мясорубка (Shredder v2)
+- **Surgical Shredding:** Логика переписана: теперь крошится **только область SNI** (30-40 байт), а не начало пакета. 
+- **Chunk Optimization:** Увеличен размер чанка до 15-20 байт. Суммарная задержка на крошение снижена до <5 мс, что исключает таймауты `context deadline exceeded`.
+
+## [Release #3.9] - Shredder Optimization & Smart Integration
+
+### 🚀 Улучшения Shredder (Мясорубки)
+- **Smart Shredding:** Реализована интеграция с `SmartSplit`. Теперь в режиме `SNISmartSplit` крошится не фиксированный лимит байт, а только ПЕРВАЯ запись разреза (ровно до середины SNI). Это радикально снижает задержку.
+- **Overhead Reduction:** Обновлена матрица профилей. Увеличен размер чанков (до 5-10 байт) и уменьшен лимит (до 80 байт). Суммарная задержка на крошение теперь составляет ~10-20 мс против прежних 300+ мс.
+- **Handshake Success:** Исправлена проблема `context deadline exceeded` для стабильных доменов (YouTube/Discord) при использовании Мясорубки.
+
+## [Release #3.8] - Tuner Trim & SmartSplit Mid-SNI
+
+### 🛠 Изменения
+- **Auto-Tuner:** Профили Disorder #6–#8 вынесены в `tuner_profiles_archive.go` (быстрое восстановление через append).
+- **SmartSplit v2:** Разрез по **середине** SNI (`TLSSplitPos: 0`), а не `offset+1` — домен делится ~50/50 между TLS records.
+- Активная матрица: 7 профилей (0–6), без Disorder-раундов.
+
+---
+
+## [Release #3.7] - Fragmentation Audit Hot-Fix
+
+### 🛠 Критические исправления
+- **MixedCase:** Мутация SNI теперь **in-place** в исходном буфере (раньше менялась копия `[]byte(hostName)` — wire-пакет не менялся).
+- **SNI Parser:** Новый `findSNIOffsetInTLS` с явным разбором ClientHello (вместо ненадёжного `cap()`-хака).
+- **Disorder:** Без TTL=1 reverse-order ломал TLS на сервере (`illegal parameter`). Временно: ordered split + delay (timing-only для DPI).
+- **sleep_ms JSON:** Кастомный Marshal/Unmarshal — миллисекунды в SharedPreferences, не наносекунды Go.
+
+### 📝 Диагностика
+- `🔍 [Fragment-1stWrite]` / `MixedCase` / `L7` / `L7-Smart` / `TestStrategy` — расширенные логи для отчётов (без hex dump — только SNI/offset/len).
+
+---
+
+## [Release #3.6] - Performance Polish & Code Hygiene
+
+### 🚀 Оптимизация
+- **Log Cleanup:** Удалены избыточные логи, включая тяжелые Hex-дампы и технические сообщения о сборке Pipeline. Лог теперь содержит только ключевые события (успех мутации SNI, результаты тюнинга). Это снижает нагрузку на CPU и делает отладку более сфокусированной.
+- **Surgical Precision:** Финализирована логика "умного сплита" по SNI. Оффсеты вычисляются с точностью до байта через механизмы `cap()`.
+
+## [Release #3.5] - The Kamikaze Strike & Protocol Integrity
+
+### 🚀 Новые возможности
+- **Fake Packets (Kamikaze Strategy):** Внедрен `FakePacketMiddleware`. Перед основным соединением отправляется "пакет-диверсия" через защищенный сокет (`VpnService.protect()`). Это переключает внимание DPI на фиктивную сессию.
+- **Advanced Strategy Matrix:** Добавлен Профиль #7 — ультимативная комбинация Fake Packets + MixedCase SNI + L7 Fragmentation.
+
+### 🛠 Критические исправления (TLS Stability)
+- **Transcript Hash Sync:** Полностью устранена ошибка `tls: bad record MAC`. Теперь `AutoTuner` и `MixedCaseMiddleware` используют детерминированную мутацию ("First Upper"), синхронизированную через `tls.Config`.
+- **Surgical Mutation:** Отказ от рискованной пересборки пакета в пользу ювелирной in-place мутации через `cryptobyte`. Это гарантирует 100% сохранение длины и структуры TLS-сообщения.
+- **Pipeline Refactoring:** Логика обхода DPI полностью переведена на Middleware. Установлен строго регламентированный порядок слоев для исключения конфликтов между мутацией и фрагментацией.
+
 ## [Release #3.4] - SNI Parser & Logic Fixes (Хирургическая точность)
 
-### 🚀 Исправления и улучшения
-- **Parser Fix:** Исправлена критическая ошибка использования `cryptobyte` в `mixed_case.go`. Теперь тело Handshake читается из родительской строки, что восстанавливает цепочку парсинга ClientHello.
-- **Header Offset:** Скорректирован оффсет TLS Record Header (5 байт). Теперь Handshake Type определяется безошибочно.
-- **Resilient Handshake:** Флаг `firstDone` в `MixedCaseMiddleware` теперь выставляется только при успешной мутации или окончательном отказе. Это дает системе шанс поймать ClientHello, если он фрагментирован на уровне приложения.
-- **Diagnostic Logging:** Добавлены детальные логи для отслеживания первого `Write` и результатов поиска SNI.
+### 🚀 Критические архитектурные изменения
+- **Pipeline Layer Ordering:** Полный перенос логики обхода DPI в `Middleware`. Установлен строго регламентированный порядок слоев: **Bypass (внешний) -> SNI Mutation -> Fragmentation (внутренний)**. Это гарантирует, что мутация SNI работает с полным пакетом ClientHello до того, как фрагментатор разрежет его на части.
+- **Global State Decoupling:** Мидлвари теперь полностью независимы от глобальной переменной `activeStrategy`. Конфигурация передается напрямую через конструкторы в `BuildPipeline`, что позволило `AutoTuner` корректно тестировать мутации в разных профилях.
+- **Kotlin-Go Sync:** Внедрена строгая синхронизация JSON-тегов (`mixed_case`). Обновлен `ConfigManager.kt` для гарантированной передачи флагов активации новых методов.
+
+### 🛠 Исправления парсера и логики
+- **Parser Fix:** Исправлена критическая ошибка использования `cryptobyte` в `mixed_case.go` (чтение из родительской строки).
+- **Header Offset:** Скорректирован оффсет TLS Record Header до 5 байт для безошибочного определения типа Handshake.
+- **Resilient Handshake:** Флаг `firstDone` теперь выставляется только при успешной мутации или окончательном отказе. Это позволяет системе "дождаться" ClientHello, если он фрагментирован на уровне приложения.
+- **Timeout Polish:** Таймаут TLS-хендшейка в тюнере увеличен до 6 секунд для стабильной работы через цепочку Middleware.
 
 ## [Release #3.3] - Comprehensive Audit & Stability Polish
 
