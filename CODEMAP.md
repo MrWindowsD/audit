@@ -23,31 +23,32 @@
 
 ## 3. Ключевые архитектурные решения
 
+### 3.0. Принципы (не нарушать)
+
+| Принцип | Смысл |
+|---------|--------|
+| **Фрагментация ≠ поломка** | DPI-обход не должен отрезать часть трафика. Профиль применяется ко всему TCP с `type ≠ 0` (кроме 127.x/::1). Если ломает — баг в стратегии/пайплайне. |
+| **test_domains ≠ маршрутизация** | Список только для **Auto-Tuner** (Prober). Никакого split-tunnel через этот список. |
+| **Split-tunnel → Epic 5** | Домены + приложения — отдельный эпик (rule-sets, Fake-IP+route, `addDisallowedApplication`). До этого — глобальный VPN + глобальный профиль фрагментации. |
+
 ### 3.1. Фрагментация и Auto-Tuner (Epic 3 Expansion)
-- **Цель:** Добиться стабильных 85-90% успеха пробития.
-- **Алгоритм:** Реализован параллельный пробинг расширенного набора стратегий. 
-- **Новые методы:**
-    - **TTL Trick:** Первый байт данных уходит с TTL=3..5, DPI видит его, но магистральный роутер отбрасывает.
-    - **Fake Packets:** Перед реальным ClientHello летят пакеты со случайным мусором.
-    - **HTTP Obf:** `Host:` -> `hOsT:`, добавление `\r` или пробелов.
-- **Параллелизм:** Ограничен 5-8 одновременными сокетами в зависимости от типа стратегии.
-- **Таймауты:** Динамические (от 7 до 15 сек) — медленные L4 стратегии получают больше времени на выполнение пауз.
-- **Интеграция:** Результаты тюнинга (`sendTuningStatus`) зажигают "квадратики" в UI, а финальный конфиг (`onProfileFound`) сохраняется в Kotlin.
+- **Live-фрагментация:** При активном профиле (`StrategyNone` исключён) весь TCP через `BuildPipeline` в `proxyTCP`. `test_domains` — **только** Auto-Tuner.
+- **Surgical Shredder:** Крошение только байт доменного имени (SNI) с микро-задержками для десинхронизации DPI.
+- **IPv4 Only:** Отключение IPv6 в TUN для исключения побочных попыток соединения по недоступным протоколам.
+- **Архитектура Pipeline:** Использование паттерна Middleware для сборки цепочки обработки трафика. 
+- **Критический порядок слоев:** 
+    1.  **BypassMiddleware:** Только loopback (127.x / ::1) без DPI-слоя.
+    2.  **FakePacketMiddleware:** Отправляет "камикадзе"-пакет.
+    3.  **SNIMixedCaseMiddleware:** Мутирует регистр SNI.
+    4.  **FragmentationMiddleware:** Осуществляет финальное дробление (L4/L7/Shredder).
 
 ### 3.2. Локальный Bypass
-- **isLocalAddr:** Функция в Go-ядре, отсекающая Loopback и приватные подсети.
-- **Silent Bypass:** Мгновенное отклонение (TCP RST) локальных пакетов прямо в Forwarder-ах gVisor. Это предотвращает таймауты при попытках ОС достучаться до роутера (например, 10.0.0.1) через VPN.
-- **Логика:** Трафик на локальные IP (например, 10.0.0.1) идет через `io.Copy` напрямую, минуя фрагментацию, что предотвращает блокировки админок роутеров. (Примечание: часть трафика теперь отсекается еще раньше на уровне Forwarder).
+- **Silent Bypass:** Мгновенное отклонение (TCP RST) локальных пакетов прямо в Forwarder-ах gVisor.
+- **DNS Compatibility:** UDP-трафик на локальные адреса разрешен для корректной работы системных DNS-резолверов.
 
 ### 3.3. Управление конфигурацией (ConfigManager)
-- **Kotlin Side:** Синглтон `ConfigManager` управляет `SharedPreferences`.
-- **Go Side:** `EngineConfig` в `main.go` поддерживает вложенную структуру стратегий и флаг `force_rebuild`.
-
-### 3.4. Стабильность и защита (Anti-Crash)
-- **Механизм:** Во всех асинхронных горутинах (Auto-Tuner, Proxy TCP/UDP) внедрен `recover()`.
-- **Результат:** Паника в отдельной горутине не приводит к `Fatal CGO error` и падению всего Android-процесса. Ошибка логируется, но остальные части приложения продолжают работать.
-- **Ресурсная безопасность:** Гарантированное закрытие TUN-дескриптора и сокетов через многоуровневые `defer` и проверку состояний `Engine`.
-- **Точность парсинга:** Использование `cryptobyte` для In-place мутации SNI без изменения длины пакета и нарушения целостности TLS Record.
+- **Data Flow:** Kotlin (`ConfigManager`) -> JSON -> Go (`EngineConfig`).
+- **Синхронизация:** Поля `mixed_case` и `fake_packets` в JSON являются обязательными для активации новых методов.
 
 ---
 
@@ -65,26 +66,30 @@ ProjectViski/
 │       │   └── service/
 │       │       └── OptimizerVpnService.kt # Жизненный цикл VPN, инъекция конфига
 ├── go-core/
-│   ├── main.go                 # Точка входа, логирование входящего JSON, JNI LogWriter
-│   ├── bridge.c                # JNI Registration, callbacks (sendLog, sendTuningStatus)
-│   ├── build.ps1               # Кросс-сборка под arm64, arm, x86_64, x86
+│   ├── main.go                 # Точка входа, JNI LogWriter
+│   ├── bridge.c                # JNI Registration, callbacks
+│   ├── build.ps1               # Кросс-сборка под все архитектуры
 │   └── stack/
-│       ├── netstack.go         # Стек gVisor, Engine struct, Silent Bypass logic
-│       ├── proxy.go            # TCP/UDP проксирование, Pipeline integration
-│       ├── pipeline.go         # Абстракция Dialer/Middleware, сборка цепочек обхода
-│       ├── mixed_case.go       # SNI Mutation через cryptobyte (In-place)
-│       ├── hex_debug.go        # Утилиты логирования трафика (debug build)
-│       └── fragmentation.go    # Матрица стратегий, Auto-Tuner, фрагментация L4/L7
-└── docs/                       # Единый центр документации + RELEASE_NOTES.md
+│       ├── netstack.go         # Стек gVisor, Silent Bypass logic
+│       ├── proxy.go            # TCP/UDP проксирование, Pipeline execution
+│       ├── pipeline.go         # Абстракция Dialer/Middleware, сборка цепочек
+│       ├── mixed_case.go       # SNI Mutation (Deterministic "First Upper")
+│       ├── fake_packets.go     # Kamikaze Strategy (Protected dummy sockets)
+│       ├── hex_debug.go        # Утилиты логирования (limit 512 bytes)
+│       ├── smart_split.go          # SmartSplit mid-SNI / legacy modes
+│       ├── tuner_profiles_archive.go # Архив Disorder #6–#8 (вне тюнера)
+│       └── fragmentation.go    # Матрица стратегий (7 профилей), Auto-Tuner
+└── docs/                       # Единый центр документации
 ```
 
 ---
 
 ## 5. Статус по эпикам
 
-| Эпик | Статус | Комментарий |
-|------|--------|-------------|
-| **Epic 1** | ✅ **Done** | Инфраструктура, JNI-мост, логирование. |
-| **Epic 2** | ✅ **Done** | gVisor Netstack + Proxy. Стабильная остановка. |
-| **Epic 3** | ✅ **Done** | **Фрагментация трафика и Auto-Tuner.** |
-| **Epic 4** | 🔄 *Next* | DNS-маршрутизация (Fake-IP) и каскадный фильтр. |
+| Эпик | Статус             | Комментарий |
+|------|--------------------|-------------|
+| **Epic 1** | ✅ **Done**         | Инфраструктура и логирование. |
+| **Epic 2** | ✅ **Done**         | gVisor Netstack и стабильная остановка. |
+| **Epic 3** | 🔄 **In progress** | **Фрагментация, SNI Mutation и Fake Packets.** |
+| **Epic 4** | 🔄 *Next*          | DNS-маршрутизация (Fake-IP) и каскадный фильтр. |
+| **Epic 5** | 📋 *Planned*       | Split-tunnel: домены (rule-sets) + приложения (Android API). |
